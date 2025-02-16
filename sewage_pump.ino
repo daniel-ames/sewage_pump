@@ -1,24 +1,40 @@
 
 #include <Adafruit_ADS1X15.h>
+#include <ESP8266WiFi.h>
+
+const char* ssid = "AmesHouse";
+const char* password = "Thunderbird1";
+
+const char* host = "192.168.1.166";
+const uint16_t port = 27910;
 
 Adafruit_ADS1115 ads;
 
-
-uint32_t number_of_samples = 240;
-uint32_t trigger = 100;
-int no_more_samples = 0;
-int no_more_output = 0;
-
 float multiplier = 0.0625f;
 
-int samples[240];
-int samples_index = 0;
 
 void setup() {
   Serial.begin(115200);
   pinMode(LED_BUILTIN, OUTPUT);
   delay(1000);
   Serial.println(F("Hello"));
+
+  Serial.println(); Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
 
   Wire.begin();
   ads.begin();
@@ -49,6 +65,8 @@ int vector = 0;
 
 int delta = 0;
 
+WiFiClient client;
+
 void loop() {
 
   //digitalWrite(LED_BUILTIN, LOW);
@@ -58,14 +76,12 @@ void loop() {
   // Read current
   a0_a1 = ads.readADC_Differential_0_1();
 
-  if (a0_a1 != 0 && a0_a1 != -1)
-  {
+  if (a0_a1 != 0 && a0_a1 != -1) {
     mv = a0_a1 * multiplier;
     delta = mv - prev_mv;
     vector = delta > 0 ? 1 : -1;
 
-    if (vector == -1 && prev_vector == 1)
-    {
+    if (vector == -1 && prev_vector == 1) {
       // Voltage is dropping from its positive peak.
       // This means the last mv value is the peak.
       // Calculate rms of the peak voltage. Keep it simple.
@@ -73,8 +89,17 @@ void loop() {
       // Then x100 because the SCT-013-000V puts out 100A per 1V.
       // Then x.707 to get rough rms.
       current_rms = prev_mv / 1000 * 100 * 0.707f;
-      if (current_rms > 0)
-        Serial.println(current_rms);
+      if (current_rms > 0) {
+        if (!client.connect(host, port)) {
+          Serial.println("connection failed");
+          delay(5000);
+        }
+        else {
+          if (client.connected()) { client.println(current_rms); }
+          Serial.println(current_rms);
+          client.stop();
+        }
+      }
     }
     prev_vector = vector;
     prev_mv = mv;
