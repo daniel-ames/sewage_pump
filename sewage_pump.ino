@@ -2,6 +2,10 @@
 #include <Adafruit_ADS1X15.h>
 #include <ESP8266WiFi.h>
 
+#define MSG_SIZE_MAX    16
+#define FLOAT_SIZE_MAX  8
+#define MAX_WIFI_WAIT   10
+
 const char* ssid = "AmesHouse";
 const char* password = "Thunderbird1";
 
@@ -11,6 +15,30 @@ const uint16_t port = 27910;
 Adafruit_ADS1115 ads;
 
 float multiplier = 0.0625f;
+
+void connectToWifi()
+{
+  int wifiRetries = 0;
+  WiFi.mode(WIFI_STA);
+  Serial.print("WiFi is down. Connecting");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED && wifiRetries < MAX_WIFI_WAIT) {
+    delay(1000);
+    wifiRetries++;
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+     // setupOta will only do its thing once per boot,
+     // so it's ok to call it every time we connect. It won't duplicate its work.
+     //setupOta();
+  } else {
+     Serial.println("WiFi failed to connect");
+  }
+}
 
 
 void setup() {
@@ -23,18 +51,7 @@ void setup() {
   Serial.print("Connecting to ");
   Serial.println(ssid);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println();
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
+  connectToWifi();
 
   Wire.begin();
   ads.begin();
@@ -66,10 +83,16 @@ int vector = 0;
 int delta = 0;
 
 WiFiClient client;
+char msg[MSG_SIZE_MAX];
+char tempFloat[FLOAT_SIZE_MAX];
 
 void loop() {
 
   //digitalWrite(LED_BUILTIN, LOW);
+  if (WiFi.status() != WL_CONNECTED) {
+    // wifi died. try to reconnect
+    connectToWifi();
+  }
 
   delay(8);
 
@@ -89,14 +112,17 @@ void loop() {
       // Then x100 because the SCT-013-000V puts out 100A per 1V.
       // Then x.707 to get rough rms.
       current_rms = prev_mv / 1000 * 100 * 0.707f;
-      if (current_rms > 0) {
+      if (current_rms > 0 && WiFi.status() == WL_CONNECTED) {
         if (!client.connect(host, port)) {
           Serial.println("connection failed");
           delay(5000);
-        }
-        else {
-          if (client.connected()) { client.println(current_rms); }
-          Serial.println(current_rms);
+        } else {
+          memset(tempFloat, 0, FLOAT_SIZE_MAX);
+          memset(msg, 0, MSG_SIZE_MAX);
+          dtostrf(current_rms, 3, 2, tempFloat);
+          snprintf(msg, MSG_SIZE_MAX, "sp:%s", tempFloat);
+          if (client.connected()) { client.println(msg); }
+          Serial.println(msg);
           client.stop();
         }
       }
