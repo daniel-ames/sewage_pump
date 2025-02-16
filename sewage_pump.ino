@@ -1,6 +1,11 @@
-
+//
+// This monitors the operation of the sewage pump
+//
 #include <Adafruit_ADS1X15.h>
 #include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
+#include <ESP8266HTTPUpdateServer.h>
 
 #define MSG_SIZE_MAX    16
 #define FLOAT_SIZE_MAX  8
@@ -8,11 +13,14 @@
 
 const char* ssid = "AmesHouse";
 const char* password = "Thunderbird1";
+const char* ota_hostname = "sewage_pump";
 
 const char* host = "192.168.1.166";
 const uint16_t port = 27910;
 
 Adafruit_ADS1115 ads;
+ESP8266WebServer httpServer(80);
+ESP8266HTTPUpdateServer httpUpdater;
 
 float multiplier = 0.0625f;
 
@@ -32,9 +40,6 @@ void connectToWifi()
     Serial.println("WiFi connected");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
-     // setupOta will only do its thing once per boot,
-     // so it's ok to call it every time we connect. It won't duplicate its work.
-     //setupOta();
   } else {
      Serial.println("WiFi failed to connect");
   }
@@ -55,6 +60,13 @@ void setup() {
 
   Wire.begin();
   ads.begin();
+
+  MDNS.begin(ota_hostname);
+
+  httpUpdater.setup(&httpServer);
+  httpServer.begin();
+
+  MDNS.addService("http", "tcp", 80);
 
   //                                                                ADS1015  ADS1115
   //                                                                -------  -------
@@ -92,6 +104,9 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     // wifi died. try to reconnect
     connectToWifi();
+  } else {
+    httpServer.handleClient();
+    MDNS.update();
   }
 
   delay(8);
@@ -131,26 +146,3 @@ void loop() {
     prev_mv = mv;
   }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
