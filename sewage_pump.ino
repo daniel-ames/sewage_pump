@@ -134,7 +134,7 @@ void loop() {
       // This means the last mv value is the peak.
       // Calculate rms of the peak voltage. Keep it simple.
       // prev_mv is in millivolts, so divide by 1000 to turn it back into whole Volts.
-      // Then x100 because the SCT-013-000V puts out 100A per 1V.
+      // Then x100 because the SCT-013-000V puts out 1V per 100A.
       // Then x.707 to get rough rms.
       current_rms = prev_mv / 1000 * 100 * 0.707f;
       if (current_rms > 0 && WiFi.status() == WL_CONNECTED) {
