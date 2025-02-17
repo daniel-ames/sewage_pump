@@ -1,7 +1,7 @@
 //
 // This monitors the operation of the sewage pump
 //
-#include <Adafruit_ADS1X15.h>
+#include <Adafruit_ADS1X15.h> // from package "Adafruit ADS1X15" by Adafruit
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
@@ -15,7 +15,7 @@ const char* ssid = "AmesHouse";
 const char* password = "Thunderbird1";
 const char* ota_hostname = "sewage_pump";
 
-const char* host = "192.168.1.166";
+const char* host = "optiplex";
 const uint16_t port = 27910;
 
 Adafruit_ADS1115 ads;
@@ -76,7 +76,8 @@ void setup() {
   // ads.setGain(GAIN_FOUR);       // 4x gain   +/- 1.024V  1 bit = 0.5mV    0.03125mV
   // ads.setGain(GAIN_EIGHT);      // 8x gain   +/- 0.512V  1 bit = 0.25mV   0.015625mV
   // ads.setGain(GAIN_SIXTEEN);    // 16x gain  +/- 0.256V  1 bit = 0.125mV  0.0078125mV
-  // The above from taken from https://github.com/GreenPonik/Adafruit_ADS1X15/blob/7fce1e43c48ae32c40f806362060d91b34de3318/examples/differential/differential.pde
+  
+  // The above is taken from https://github.com/GreenPonik/Adafruit_ADS1X15/blob/7fce1e43c48ae32c40f806362060d91b34de3318/examples/differential/differential.pde
   // The output of the SCT-013-000V (which I'm pretty sure is what i have) will be between 0V-1V.
   // 1V means 100A which we should never see, BUT, anything can happen sometimes. i don't wanna damage my ADS.
   // So go with GAIN_TWO. That should keep us safe.
@@ -115,6 +116,15 @@ void loop() {
   a0_a1 = ads.readADC_Differential_0_1();
 
   if (a0_a1 != 0 && a0_a1 != -1) {
+    // Because you're going to come back in here years later and not know wth this is doing, here's a bone.
+    // Remember that a0_a1 is a reading of the differential voltage between A0 and A1 of the ADC.
+    // We set the gain at "GAIN_TWO", which means the adc is reading voltage between +2.048V and -2.048V,
+    // at 16 bits of resolution (65535 possible values). That's a full peak to peak range of (2.048 * 2 = 4.096).
+    // 4.096 / 65535 = .0625. So 16 bits can tell us a value between +-2.048v within .0625v of accuracy.
+    // To calculate the actual voltage value, you can think of it like divisions on an oscilliscope.
+    // Whatever it spits out, you have to multiply it by whatever each division represents.
+    // In our case, .0625. If you change the gain in the future, you gotta see what that full pk2pk range is,
+    // divide it by the resolution of the adc (16 bits [65535] for the ADS 1115), and use that as your 'multiplier'.
     mv = a0_a1 * multiplier;
     delta = mv - prev_mv;
     vector = delta > 0 ? 1 : -1;
@@ -128,10 +138,7 @@ void loop() {
       // Then x.707 to get rough rms.
       current_rms = prev_mv / 1000 * 100 * 0.707f;
       if (current_rms > 0 && WiFi.status() == WL_CONNECTED) {
-        if (!client.connect(host, port)) {
-          Serial.println("connection failed");
-          delay(5000);
-        } else {
+        if (client.connect(host, port)) {
           memset(tempFloat, 0, FLOAT_SIZE_MAX);
           memset(msg, 0, MSG_SIZE_MAX);
           dtostrf(current_rms, 3, 2, tempFloat);
@@ -139,6 +146,9 @@ void loop() {
           if (client.connected()) { client.println(msg); }
           Serial.println(msg);
           client.stop();
+        } else {
+          Serial.println("connection failed");
+          delay(500);
         }
       }
     }
