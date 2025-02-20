@@ -76,10 +76,10 @@ void setup() {
   // ads.setGain(GAIN_FOUR);       // 4x gain   +/- 1.024V  1 bit = 0.5mV    0.03125mV
   // ads.setGain(GAIN_EIGHT);      // 8x gain   +/- 0.512V  1 bit = 0.25mV   0.015625mV
   // ads.setGain(GAIN_SIXTEEN);    // 16x gain  +/- 0.256V  1 bit = 0.125mV  0.0078125mV
-  
+
   // The above is taken from https://github.com/GreenPonik/Adafruit_ADS1X15/blob/7fce1e43c48ae32c40f806362060d91b34de3318/examples/differential/differential.pde
   // The output of the SCT-013-000V (which I'm pretty sure is what i have) will be between 0V-1V.
-  // 1V means 100A which we should never see, BUT, anything can happen sometimes. i don't wanna damage my ADS.
+  // 1V means 100A which we should never see, BUT, anything can happen sometimes. i don't wanna damage my ADC.
   // So go with GAIN_TWO. That should keep us safe.
   ads.setGain((adsGain_t)GAIN_TWO);
 }
