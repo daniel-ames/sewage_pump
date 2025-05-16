@@ -11,6 +11,10 @@
 #define FLOAT_SIZE_MAX  8
 #define MAX_WIFI_WAIT   10
 
+// the builtin led is active low for some dipshit reason
+#define ON  LOW
+#define OFF HIGH
+
 const char* ssid = "AmesHouse";
 const char* password = "Thunderbird1";
 const char* ota_hostname = "sewage_pump";
@@ -47,10 +51,12 @@ void connectToWifi()
 
 
 void setup() {
-  Serial.begin(115200);
   pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, OFF);
+
+  Serial.begin(115200);
   delay(1000);
-  Serial.println(F("Hello"));
+  Serial.println("Hello");
 
   Serial.println(); Serial.println();
   Serial.print("Connecting to ");
@@ -99,15 +105,30 @@ WiFiClient client;
 char msg[MSG_SIZE_MAX];
 char tempFloat[FLOAT_SIZE_MAX];
 
+int led_timer = 0;
+bool led_on = false;
+
 void loop() {
 
-  //digitalWrite(LED_BUILTIN, LOW);
   if (WiFi.status() != WL_CONNECTED) {
     // wifi died. try to reconnect
     connectToWifi();
   } else {
     httpServer.handleClient();
     MDNS.update();
+  }
+
+  if (led_timer > 0) {
+    if (!led_on) {
+      digitalWrite(LED_BUILTIN, ON);
+      led_on = true;
+    }
+    led_timer--;
+  } else {
+    if (led_on) {
+      digitalWrite(LED_BUILTIN, OFF);
+      led_on = false;
+    }
   }
 
   delay(8);
@@ -151,6 +172,7 @@ void loop() {
           delay(500);
         }
       }
+      led_timer = 20;
     }
     prev_vector = vector;
     prev_mv = mv;
