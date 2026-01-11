@@ -6,6 +6,7 @@
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
 #include <ESP8266HTTPUpdateServer.h>
+#include "street_cred.h"
 
 #define MSG_SIZE_MAX    16
 #define FLOAT_SIZE_MAX  8
@@ -15,11 +16,8 @@
 #define ON  LOW
 #define OFF HIGH
 
-const char* ssid = "AmesHouse";
-const char* password = "Thunderbird1";
-const char* ota_hostname = "sewage_pump";
-
 const char* host = "optiplex";
+//const char* host = "192.168.1.212";
 const uint16_t port = 27910;
 
 Adafruit_ADS1115 ads;
@@ -165,10 +163,10 @@ void loop() {
           dtostrf(current_rms, 3, 2, tempFloat);
           snprintf(msg, MSG_SIZE_MAX, "sp:%s", tempFloat);
           if (client.connected()) { client.println(msg); }
-          Serial.println(msg);
+          //Serial.println(msg);
           client.stop();
         } else {
-          Serial.println("connection failed");
+          //Serial.println("connection failed");
           delay(500);
         }
       }
