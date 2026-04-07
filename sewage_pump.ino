@@ -8,7 +8,7 @@
 #include <ESP8266HTTPUpdateServer.h>
 #include "street_cred.h"
 
-#define MSG_SIZE_MAX    16
+#define MSG_SIZE_MAX    32
 #define FLOAT_SIZE_MAX  8
 #define MAX_WIFI_WAIT   10
 
@@ -23,6 +23,11 @@ const uint16_t port = 27910;
 Adafruit_ADS1115 ads;
 ESP8266WebServer httpServer(80);
 ESP8266HTTPUpdateServer httpUpdater;
+
+#define SYS_STATUS_PAGE_STR_LEN 2560
+char systemStatusPageStr[SYS_STATUS_PAGE_STR_LEN];
+char httpStr[256] = {0};
+char current_time[41];
 
 float multiplier = 0.0625f;
 
@@ -47,6 +52,75 @@ void connectToWifi()
   }
 }
 
+// Converts milliseconds into natural language
+void millisToDaysHoursMinutes(unsigned long milliseconds, char* str, int length)
+{
+  uint seconds = milliseconds / 1000;
+  memset(str, 0, length);
+
+  if (seconds <= 60) {
+    // It's only been a few seconds
+    // Longest string example, 11 chars: 59 seconds\0
+    snprintf(str, 11, "%d second%s", seconds, seconds == 1 ? "" : "s");
+    return;
+  }
+  uint minutes = seconds / 60;
+  if (minutes <= 60) {
+    // It's only been a few minutes
+    // Longest string example, 11 chars: 59 minutes\0
+    snprintf(str, 11, "%d minute%s", minutes, minutes == 1 ? "" : "s");
+    return;
+  }
+  uint hours = minutes / 60;
+  minutes -= hours * 60;
+  if (hours <= 24) {
+    // It's only been a few hours
+    if (minutes == 0)
+      // Longest string example, 9 chars: 23 hours\0
+      snprintf(str, 9, "%d hour%s", hours, hours == 1 ? "" : "s");
+    else
+      // Longest string example, 24 chars: 23 hours and 59 minutes\0
+      snprintf(str, 24, "%d hour%s and %d minute%s", hours, hours == 1 ? "" : "s", minutes, minutes == 1 ? "" : "s");
+    return;
+  }
+
+  // It's been more than a day
+  uint days = hours / 24;
+  hours -= days * 24;
+  if (minutes == 0)
+    // Longest string example, 23 chars: 9999 days and 23 hours\0
+    snprintf(str, 23, "%d day%s and %d hour%s", days, days == 1 ? "" : "s", hours, hours == 1 ? "" : "s");
+  else
+    // Longest string example, 35 chars: 9999 days, 23 hours and 59 minutes\0
+    snprintf(str, 35, "%d day%s, %d hour%s and %d minute%s", days, days == 1 ? "" : "s", hours, hours == 1 ? "" : "s", minutes, minutes == 1 ? "" : "s");
+}
+
+
+char* getSystemStatus()
+{
+  String html;
+  // Pardon the html mess. Gotta tell the browser to not make the text super tiny.
+  html = "<!DOCTYPE html><html><head><title>Sewage Pump</title></head><body><p style=\"font-size:36px\">";
+  html += "<span style=\"font-size:90px\">";
+
+  // Longest string example, 82 chars: Notifications are <span id='lights_span' style="color:Green;">ON</span>
+  snprintf(httpStr, 100, "RSSI: %d", WiFi.RSSI());
+  html += httpStr;
+  html += "</br>";
+  millisToDaysHoursMinutes(millis(), current_time, 40);
+  snprintf(httpStr, 60, "Uptime: %s", current_time);
+  html += httpStr;
+  html += "</br>";
+  html += "</span></br>";
+  
+  // Close it off
+  html += "</p></body></html>";
+
+  memset(systemStatusPageStr, 0, SYS_STATUS_PAGE_STR_LEN);
+  html.toCharArray(systemStatusPageStr, html.length() + 1);
+  return systemStatusPageStr;
+}
+
 
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
@@ -66,6 +140,11 @@ void setup() {
   ads.begin();
 
   MDNS.begin(ota_hostname);
+
+  httpServer.on("/", HTTP_GET, []() {
+    httpServer.sendHeader("Connection", "close");
+    httpServer.send(200, "text/html", getSystemStatus());
+  });
 
   httpUpdater.setup(&httpServer);
   httpServer.begin();
@@ -161,7 +240,7 @@ void loop() {
           memset(tempFloat, 0, FLOAT_SIZE_MAX);
           memset(msg, 0, MSG_SIZE_MAX);
           dtostrf(current_rms, 3, 2, tempFloat);
-          snprintf(msg, MSG_SIZE_MAX, "sp:%s", tempFloat);
+          snprintf(msg, MSG_SIZE_MAX, "dev=1 amps=%s\n", tempFloat);
           if (client.connected()) { client.println(msg); }
           //Serial.println(msg);
           client.stop();
