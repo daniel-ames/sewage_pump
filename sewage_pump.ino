@@ -6,6 +6,8 @@
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
 #include <ESP8266HTTPUpdateServer.h>
+#include <time.h>
+#include <TZ.h>
 #include "street_cred.h"
 
 #define MSG_SIZE_MAX    32
@@ -27,7 +29,9 @@ ESP8266HTTPUpdateServer httpUpdater;
 #define SYS_STATUS_PAGE_STR_LEN 2560
 char systemStatusPageStr[SYS_STATUS_PAGE_STR_LEN];
 char httpStr[256] = {0};
-char current_time[41];
+char uptime[41] = {0};
+char current_time[41] = {0};
+char last_flush_time[41] = {0};
 
 float multiplier = 0.0625f;
 
@@ -95,10 +99,35 @@ void millisToDaysHoursMinutes(unsigned long milliseconds, char* str, int length)
     snprintf(str, 35, "%d day%s, %d hour%s and %d minute%s", days, days == 1 ? "" : "s", hours, hours == 1 ? "" : "s", minutes, minutes == 1 ? "" : "s");
 }
 
+void get_time(char *time_buf, int size)
+{
+  int time_retries = 40;  // try for about 10 seconds
+
+  memset(time_buf, 0, size);
+  configTime(TZ_America_Chicago, "pool.ntp.org");
+
+  time_t now = time(nullptr);
+  while (now < 8 * 3600 * 2 && time_retries) {   // basically "still 1970?"
+    delay(250);
+    now = time(nullptr);
+    time_retries--;
+  }
+
+  if (time_retries) {
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    strftime(time_buf, size, "%m-%d-%Y %I:%M:%S %p", &tm_now);
+  } else {
+    snprintf(time_buf, size, "unknown");
+  }
+}
 
 char* getSystemStatus()
 {
   String html;
+  
+  get_time(current_time, sizeof(current_time));
+
   // Pardon the html mess. Gotta tell the browser to not make the text super tiny.
   html = "<!DOCTYPE html><html><head><title>Sewage Pump</title></head><body><p style=\"font-size:36px\">";
   html += "<span style=\"font-size:90px\">";
@@ -107,8 +136,14 @@ char* getSystemStatus()
   snprintf(httpStr, 100, "RSSI: %d", WiFi.RSSI());
   html += httpStr;
   html += "</br>";
-  millisToDaysHoursMinutes(millis(), current_time, 40);
-  snprintf(httpStr, 60, "Uptime: %s", current_time);
+  snprintf(httpStr, 60, "System time: %s", current_time);
+  html += httpStr;
+  html += "</br>";
+  millisToDaysHoursMinutes(millis(), uptime, 40);
+  snprintf(httpStr, 60, "Uptime: %s", uptime);
+  html += httpStr;
+  html += "</br>";
+  snprintf(httpStr, 60, "Last flush: %s", last_flush_time);
   html += httpStr;
   html += "</br>";
   html += "</span></br>";
@@ -150,6 +185,8 @@ void setup() {
   httpServer.begin();
 
   MDNS.addService("http", "tcp", 80);
+
+  snprintf(last_flush_time, sizeof(last_flush_time), "No flushes yet");
 
   //                                                                ADS1015  ADS1115
   //                                                                -------  -------
@@ -205,6 +242,7 @@ void loop() {
     if (led_on) {
       digitalWrite(LED_BUILTIN, OFF);
       led_on = false;
+      get_time(last_flush_time, sizeof(last_flush_time));
     }
   }
 
