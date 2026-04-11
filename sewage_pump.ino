@@ -20,7 +20,6 @@
 #define OFF HIGH
 
 const char* host = "optiplex";
-//const char* host = "192.168.1.212";
 const uint16_t port = 27910;
 
 Adafruit_ADS1115 ads;
@@ -42,19 +41,7 @@ float ct_amps_per_volt = 151.7f;
 
 float adc_lsb = 0.0;  // least significant bit - in adc-speak, this is volts per tick. IOW, how much does the voltage change whenever just the LSB of the reading changes. (Thanks, Sprocket)
 
-float multiplier = 0.0625f;
-
-int16_t  a0_a1;
-float prev_mv = 0.0f;
-float mv = 0.0f;
-
-float current_rms = 0.0f;
 float amps_rms = 0.0f;
-
-int prev_vector = 0;
-int vector = 0;
-
-int delta = 0;
 
 WiFiClient client;
 char msg[MSG_SIZE_MAX];
@@ -210,7 +197,8 @@ float adcLsbVoltsForCurrentGain() {
 }
 
 
-void setup() {
+void setup()
+{
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, OFF);
 
@@ -265,14 +253,14 @@ void pump_current()
 
   double sum = 0.0;
   double sumsq = 0.0;
-  int16_t x;
+  int16_t reading;
   uint32_t samples = 0;
 
   while (millis() - start_time < RMS_WINDOW) {
-    x = ads.readADC_Differential_0_1();
+    reading = ads.readADC_Differential_0_1();
 
-    sum += x;
-    sumsq += (double)x * (double)x;
+    sum += reading;
+    sumsq += (double)reading * (double)reading;
     samples++;
   }
 
@@ -284,6 +272,7 @@ void pump_current()
   // The mean is the DC component
   double mean = sum / (double)samples;
   double ex2  = sumsq / (double)samples;
+
   // Remove the DC component
   double var  = ex2 - mean * mean;
   
@@ -297,21 +286,18 @@ void pump_current()
   float vrms = (float)adc_ticks * adc_lsb;
 
   // The SCT-013-000 has "100A/1V" tattooed on it in a chinese accent.
-  // ct_amps_per_volt_* are adjusted values derived from real testing and compared
+  // ct_amps_per_volt is an adjusted value derived from real testing and compared
   // to a real clamp meter.
   amps_rms = vrms * ct_amps_per_volt;
 }
 
 
-void loop() {
+void loop()
+{
+  amps_rms = 0.0;
 
-  if (WiFi.status() != WL_CONNECTED) {
-    // wifi died. try to reconnect
-    connectToWifi();
-  } else {
-    httpServer.handleClient();
-    MDNS.update();
-  }
+  // Read current
+  pump_current();
 
   if (led_timer > 0) {
     if (!led_on) {
@@ -327,50 +313,24 @@ void loop() {
     }
   }
 
-  delay(8);
-
-  // Read current
-  a0_a1 = ads.readADC_Differential_0_1();
-
-  if (a0_a1 != 0 && a0_a1 != -1) {
-    // Because you're going to come back in here years later and not know wth this is doing, here's a bone.
-    // Remember that a0_a1 is a reading of the differential voltage between A0 and A1 of the ADC.
-    // We set the gain at "GAIN_TWO", which means the adc is reading voltage between +2.048V and -2.048V,
-    // at 16 bits of resolution (65535 possible values). That's a full peak to peak range of (2.048 * 2 = 4.096).
-    // 4.096 / 65535 = .0625. So 16 bits can tell us a value between +-2.048v within .0625v of accuracy.
-    // To calculate the actual voltage value, you can think of it like divisions on an oscilliscope.
-    // Whatever it spits out, you have to multiply it by whatever each division represents.
-    // In our case, .0625. If you change the gain in the future, you gotta see what that full pk2pk range is,
-    // divide it by the resolution of the adc (16 bits [65535] for the ADS 1115), and use that as your 'multiplier'.
-    mv = a0_a1 * multiplier;
-    delta = mv - prev_mv;
-    vector = delta > 0 ? 1 : -1;
-
-    if (vector == -1 && prev_vector == 1) {
-      // Voltage is dropping from its positive peak.
-      // This means the last mv value is the peak.
-      // Calculate rms of the peak voltage. Keep it simple.
-      // prev_mv is in millivolts, so divide by 1000 to turn it back into whole Volts.
-      // Then x100 because the SCT-013-000V puts out 1V per 100A.
-      // Then x.707 to get rough rms.
-      current_rms = prev_mv / 1000 * 100 * 0.707f;
-      if (current_rms > 0 && WiFi.status() == WL_CONNECTED) {
-        if (client.connect(host, port)) {
-          memset(tempFloat, 0, FLOAT_SIZE_MAX);
-          memset(msg, 0, MSG_SIZE_MAX);
-          dtostrf(current_rms, 3, 2, tempFloat);
-          snprintf(msg, MSG_SIZE_MAX, "dev=1 amps=%s\n", tempFloat);
-          if (client.connected()) { client.println(msg); }
-          //Serial.println(msg);
-          client.stop();
-        } else {
-          //Serial.println("connection failed");
-          delay(500);
-        }
-      }
-      led_timer = 20;
+  if (amps_rms > 0.05f) {
+    if (client.connect(host, port)) {
+      memset(tempFloat, 0, FLOAT_SIZE_MAX);
+      memset(msg, 0, MSG_SIZE_MAX);
+      dtostrf(amps_rms, 3, 2, tempFloat);
+      snprintf(msg, MSG_SIZE_MAX, "dev=1 amps=%s\n", tempFloat);
+      if (client.connected()) { client.println(msg); }
+      //Serial.println(msg);
+      client.stop();
     }
-    prev_vector = vector;
-    prev_mv = mv;
+    led_timer = 20;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    // wifi died. try to reconnect
+    connectToWifi();
+  } else {
+    httpServer.handleClient();
+    MDNS.update();
   }
 }
