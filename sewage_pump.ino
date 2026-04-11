@@ -13,6 +13,7 @@
 #define MSG_SIZE_MAX    32
 #define FLOAT_SIZE_MAX  8
 #define MAX_WIFI_WAIT   10
+#define RMS_WINDOW      250
 
 // the builtin led is active low for some dipshit reason
 #define ON  LOW
@@ -33,7 +34,34 @@ char uptime[41] = {0};
 char current_time[41] = {0};
 char last_flush_time[41] = {0};
 
+// The CTs are supposedly 100a/v, but that's a big fat
+// load of cheap chinese hooey. These values are derived
+// from measuring against a real clamp meter.
+// TODO: calibrate this for sewage pump
+float ct_amps_per_volt = 151.7f;
+
+float adc_lsb = 0.0;  // least significant bit - in adc-speak, this is volts per tick. IOW, how much does the voltage change whenever just the LSB of the reading changes. (Thanks, Sprocket)
+
 float multiplier = 0.0625f;
+
+int16_t  a0_a1;
+float prev_mv = 0.0f;
+float mv = 0.0f;
+
+float current_rms = 0.0f;
+float amps_rms = 0.0f;
+
+int prev_vector = 0;
+int vector = 0;
+
+int delta = 0;
+
+WiFiClient client;
+char msg[MSG_SIZE_MAX];
+char tempFloat[FLOAT_SIZE_MAX];
+
+int led_timer = 0;
+bool led_on = false;
 
 void connectToWifi()
 {
@@ -157,6 +185,31 @@ char* getSystemStatus()
 }
 
 
+// Because you're going to come back in here years later and not know wth this is doing, here's a bone.
+// Remember that a0_a1 is a reading of the differential voltage between A0 and A1 of the ADC.
+// We set the gain at "GAIN_TWO", which means the adc is reading voltage between +2.048V and -2.048V,
+// at 16 bits of resolution (65535 possible values). That's a full peak to peak range of (2.048 * 2 = 4.096).
+// 4.096 / 65535 = 62.5uV. So 16 bits can tell us a value between +-2.048v within 62.5uv of accuracy.
+// To calculate the actual voltage value, you can think of it like divisions on an oscilliscope.
+// Whatever it spits out, you have to multiply it by whatever each division represents.
+// In our case, 62.5uv. If you change the gain in the future, this handy helper (Sprocket wrote it) will
+// map the gain to the LSB - Least Significant Bit. LSB is adc-speak for what I would call volts per division.
+float adcLsbVoltsForCurrentGain() {
+  adsGain_t g = ads.getGain();
+  float fs = 4.096f; // default for GAIN_ONE
+  switch (g) {
+    case GAIN_TWOTHIRDS: fs = 6.144f; break;
+    case GAIN_ONE:       fs = 4.096f; break;
+    case GAIN_TWO:       fs = 2.048f; break;
+    case GAIN_FOUR:      fs = 1.024f; break;
+    case GAIN_EIGHT:     fs = 0.512f; break;
+    case GAIN_SIXTEEN:   fs = 0.256f; break;
+    default:             fs = 4.096f; break;
+  }
+  return fs / 32768.0f;
+}
+
+
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, OFF);
@@ -202,25 +255,53 @@ void setup() {
   // 1V means 100A which we should never see, BUT, anything can happen sometimes. i don't wanna damage my ADC.
   // So go with GAIN_TWO. That should keep us safe.
   ads.setGain((adsGain_t)GAIN_TWO);
+  adc_lsb = adcLsbVoltsForCurrentGain();
 }
 
-int16_t  a0_a1;
-float prev_mv = 0.0f;
-float mv = 0.0f;
+// Read RMS amps of the pump
+void pump_current()
+{
+  uint32_t start_time = millis();
 
-float current_rms = 0.0f;
+  double sum = 0.0;
+  double sumsq = 0.0;
+  int16_t x;
+  uint32_t samples = 0;
 
-int prev_vector = 0;
-int vector = 0;
+  while (millis() - start_time < RMS_WINDOW) {
+    x = ads.readADC_Differential_0_1();
 
-int delta = 0;
+    sum += x;
+    sumsq += (double)x * (double)x;
+    samples++;
+  }
 
-WiFiClient client;
-char msg[MSG_SIZE_MAX];
-char tempFloat[FLOAT_SIZE_MAX];
+  if (samples < 10) return;
 
-int led_timer = 0;
-bool led_on = false;
+  // Sprocket came up with this math. She tried very hard to explain it to me,
+  // and I kind of get it. I get it enough to go ahead and use it.
+  // TODO: brush up on RMS theory.
+  // The mean is the DC component
+  double mean = sum / (double)samples;
+  double ex2  = sumsq / (double)samples;
+  // Remove the DC component
+  double var  = ex2 - mean * mean;
+  
+  if (var < 0) var = 0;
+
+  // Variance is a squared value. Remove the square
+  // to get back to real ticks.
+  double adc_ticks = sqrt(var);
+
+  // Convert ADC ticks to actual voltage at ADS input
+  float vrms = (float)adc_ticks * adc_lsb;
+
+  // The SCT-013-000 has "100A/1V" tattooed on it in a chinese accent.
+  // ct_amps_per_volt_* are adjusted values derived from real testing and compared
+  // to a real clamp meter.
+  amps_rms = vrms * ct_amps_per_volt;
+}
+
 
 void loop() {
 
