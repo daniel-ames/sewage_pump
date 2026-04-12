@@ -6,25 +6,49 @@
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
 #include <ESP8266HTTPUpdateServer.h>
+#include <time.h>
+#include <TZ.h>
 #include "street_cred.h"
 
-#define MSG_SIZE_MAX    16
+#define MSG_SIZE_MAX    32
 #define FLOAT_SIZE_MAX  8
 #define MAX_WIFI_WAIT   10
+#define RMS_WINDOW      250
 
 // the builtin led is active low for some dipshit reason
 #define ON  LOW
 #define OFF HIGH
 
 const char* host = "optiplex";
-//const char* host = "192.168.1.212";
 const uint16_t port = 27910;
 
 Adafruit_ADS1115 ads;
 ESP8266WebServer httpServer(80);
 ESP8266HTTPUpdateServer httpUpdater;
 
-float multiplier = 0.0625f;
+#define SYS_STATUS_PAGE_STR_LEN 2560
+char systemStatusPageStr[SYS_STATUS_PAGE_STR_LEN];
+char httpStr[256] = {0};
+char uptime[41] = {0};
+char current_time[41] = {0};
+char last_flush_time[41] = {0};
+
+// The CTs are supposedly 100a/v, but that's a big fat
+// load of cheap chinese hooey. These values are derived
+// from measuring against a real clamp meter.
+// TODO: calibrate this for sewage pump
+float ct_amps_per_volt = 151.7f;
+
+float adc_lsb = 0.0;  // least significant bit - in adc-speak, this is volts per tick. IOW, how much does the voltage change whenever just the LSB of the reading changes. (Thanks, Sprocket)
+
+float amps_rms = 0.0f;
+
+WiFiClient client;
+char msg[MSG_SIZE_MAX];
+char tempFloat[FLOAT_SIZE_MAX];
+
+int led_timer = 0;
+bool led_on = false;
 
 void connectToWifi()
 {
@@ -47,8 +71,134 @@ void connectToWifi()
   }
 }
 
+// Converts milliseconds into natural language
+void millisToDaysHoursMinutes(unsigned long milliseconds, char* str, int length)
+{
+  uint seconds = milliseconds / 1000;
+  memset(str, 0, length);
 
-void setup() {
+  if (seconds <= 60) {
+    // It's only been a few seconds
+    // Longest string example, 11 chars: 59 seconds\0
+    snprintf(str, 11, "%d second%s", seconds, seconds == 1 ? "" : "s");
+    return;
+  }
+  uint minutes = seconds / 60;
+  if (minutes <= 60) {
+    // It's only been a few minutes
+    // Longest string example, 11 chars: 59 minutes\0
+    snprintf(str, 11, "%d minute%s", minutes, minutes == 1 ? "" : "s");
+    return;
+  }
+  uint hours = minutes / 60;
+  minutes -= hours * 60;
+  if (hours <= 24) {
+    // It's only been a few hours
+    if (minutes == 0)
+      // Longest string example, 9 chars: 23 hours\0
+      snprintf(str, 9, "%d hour%s", hours, hours == 1 ? "" : "s");
+    else
+      // Longest string example, 24 chars: 23 hours and 59 minutes\0
+      snprintf(str, 24, "%d hour%s and %d minute%s", hours, hours == 1 ? "" : "s", minutes, minutes == 1 ? "" : "s");
+    return;
+  }
+
+  // It's been more than a day
+  uint days = hours / 24;
+  hours -= days * 24;
+  if (minutes == 0)
+    // Longest string example, 23 chars: 9999 days and 23 hours\0
+    snprintf(str, 23, "%d day%s and %d hour%s", days, days == 1 ? "" : "s", hours, hours == 1 ? "" : "s");
+  else
+    // Longest string example, 35 chars: 9999 days, 23 hours and 59 minutes\0
+    snprintf(str, 35, "%d day%s, %d hour%s and %d minute%s", days, days == 1 ? "" : "s", hours, hours == 1 ? "" : "s", minutes, minutes == 1 ? "" : "s");
+}
+
+void get_time(char *time_buf, int size)
+{
+  int time_retries = 40;  // try for about 10 seconds
+
+  memset(time_buf, 0, size);
+  configTime(TZ_America_Chicago, "pool.ntp.org");
+
+  time_t now = time(nullptr);
+  while (now < 8 * 3600 * 2 && time_retries) {   // basically "still 1970?"
+    delay(250);
+    now = time(nullptr);
+    time_retries--;
+  }
+
+  if (time_retries) {
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    strftime(time_buf, size, "%m-%d-%Y %I:%M:%S %p", &tm_now);
+  } else {
+    snprintf(time_buf, size, "unknown");
+  }
+}
+
+char* getSystemStatus()
+{
+  String html;
+  
+  get_time(current_time, sizeof(current_time));
+
+  // Pardon the html mess. Gotta tell the browser to not make the text super tiny.
+  html = "<!DOCTYPE html><html><head><title>Sewage Pump</title></head><body><p style=\"font-size:36px\">";
+  html += "<span style=\"font-size:90px\">";
+
+  // Longest string example, 82 chars: Notifications are <span id='lights_span' style="color:Green;">ON</span>
+  snprintf(httpStr, 100, "RSSI: %d", WiFi.RSSI());
+  html += httpStr;
+  html += "</br>";
+  snprintf(httpStr, 60, "System time: %s", current_time);
+  html += httpStr;
+  html += "</br>";
+  millisToDaysHoursMinutes(millis(), uptime, 40);
+  snprintf(httpStr, 60, "Uptime: %s", uptime);
+  html += httpStr;
+  html += "</br>";
+  snprintf(httpStr, 60, "Last flush: %s", last_flush_time);
+  html += httpStr;
+  html += "</br>";
+  html += "</span></br>";
+  
+  // Close it off
+  html += "</p></body></html>";
+
+  memset(systemStatusPageStr, 0, SYS_STATUS_PAGE_STR_LEN);
+  html.toCharArray(systemStatusPageStr, html.length() + 1);
+  return systemStatusPageStr;
+}
+
+
+// Because you're going to come back in here years later and not know wth this is doing, here's a bone.
+// Remember that a0_a1 is a reading of the differential voltage between A0 and A1 of the ADC.
+// We set the gain at "GAIN_TWO", which means the adc is reading voltage between +2.048V and -2.048V,
+// at 16 bits of resolution (65535 possible values). That's a full peak to peak range of (2.048 * 2 = 4.096).
+// 4.096 / 65535 = 62.5uV. So 16 bits can tell us a value between +-2.048v within 62.5uv of accuracy.
+// To calculate the actual voltage value, you can think of it like divisions on an oscilliscope.
+// Whatever it spits out, you have to multiply it by whatever each division represents.
+// In our case, 62.5uv. If you change the gain in the future, this handy helper (Sprocket wrote it) will
+// map the gain to the LSB - Least Significant Bit. LSB is adc-speak for what I would call volts per division.
+float adcLsbVoltsForCurrentGain() {
+  adsGain_t g = ads.getGain();
+  float fs = 4.096f; // default for GAIN_ONE
+  switch (g) {
+    case GAIN_TWOTHIRDS: fs = 6.144f; break;
+    case GAIN_ONE:       fs = 4.096f; break;
+    case GAIN_TWO:       fs = 2.048f; break;
+    case GAIN_FOUR:      fs = 1.024f; break;
+    case GAIN_EIGHT:     fs = 0.512f; break;
+    case GAIN_SIXTEEN:   fs = 0.256f; break;
+    default:             fs = 4.096f; break;
+  }
+  return fs / 32768.0f;
+}
+
+
+void setup()
+{
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, OFF);
 
@@ -67,10 +217,17 @@ void setup() {
 
   MDNS.begin(ota_hostname);
 
+  httpServer.on("/", HTTP_GET, []() {
+    httpServer.sendHeader("Connection", "close");
+    httpServer.send(200, "text/html", getSystemStatus());
+  });
+
   httpUpdater.setup(&httpServer);
   httpServer.begin();
 
   MDNS.addService("http", "tcp", 80);
+
+  snprintf(last_flush_time, sizeof(last_flush_time), "No flushes yet");
 
   //                                                                ADS1015  ADS1115
   //                                                                -------  -------
@@ -86,35 +243,61 @@ void setup() {
   // 1V means 100A which we should never see, BUT, anything can happen sometimes. i don't wanna damage my ADC.
   // So go with GAIN_TWO. That should keep us safe.
   ads.setGain((adsGain_t)GAIN_TWO);
+  adc_lsb = adcLsbVoltsForCurrentGain();
 }
 
-int16_t  a0_a1;
-float prev_mv = 0.0f;
-float mv = 0.0f;
+// Read RMS amps of the pump
+void pump_current()
+{
+  uint32_t start_time = millis();
 
-float current_rms = 0.0f;
+  double sum = 0.0;
+  double sumsq = 0.0;
+  int16_t reading;
+  uint32_t samples = 0;
 
-int prev_vector = 0;
-int vector = 0;
+  while (millis() - start_time < RMS_WINDOW) {
+    reading = ads.readADC_Differential_0_1();
 
-int delta = 0;
-
-WiFiClient client;
-char msg[MSG_SIZE_MAX];
-char tempFloat[FLOAT_SIZE_MAX];
-
-int led_timer = 0;
-bool led_on = false;
-
-void loop() {
-
-  if (WiFi.status() != WL_CONNECTED) {
-    // wifi died. try to reconnect
-    connectToWifi();
-  } else {
-    httpServer.handleClient();
-    MDNS.update();
+    sum += reading;
+    sumsq += (double)reading * (double)reading;
+    samples++;
   }
+
+  if (samples < 10) return;
+
+  // Sprocket came up with this math. She tried very hard to explain it to me,
+  // and I kind of get it. I get it enough to go ahead and use it.
+  // TODO: brush up on RMS theory.
+  // The mean is the DC component
+  double mean = sum / (double)samples;
+  double ex2  = sumsq / (double)samples;
+
+  // Remove the DC component
+  double var  = ex2 - mean * mean;
+  
+  if (var < 0) var = 0;
+
+  // Variance is a squared value. Remove the square
+  // to get back to real ticks.
+  double adc_ticks = sqrt(var);
+
+  // Convert ADC ticks to actual voltage at ADS input
+  float vrms = (float)adc_ticks * adc_lsb;
+
+  // The SCT-013-000 has "100A/1V" tattooed on it in a chinese accent.
+  // ct_amps_per_volt is an adjusted value derived from real testing and compared
+  // to a real clamp meter.
+  amps_rms = vrms * ct_amps_per_volt;
+}
+
+
+void loop()
+{
+  amps_rms = 0.0;
+
+  // Read current
+  pump_current();
 
   if (led_timer > 0) {
     if (!led_on) {
@@ -126,53 +309,28 @@ void loop() {
     if (led_on) {
       digitalWrite(LED_BUILTIN, OFF);
       led_on = false;
+      get_time(last_flush_time, sizeof(last_flush_time));
     }
   }
 
-  delay(8);
-
-  // Read current
-  a0_a1 = ads.readADC_Differential_0_1();
-
-  if (a0_a1 != 0 && a0_a1 != -1) {
-    // Because you're going to come back in here years later and not know wth this is doing, here's a bone.
-    // Remember that a0_a1 is a reading of the differential voltage between A0 and A1 of the ADC.
-    // We set the gain at "GAIN_TWO", which means the adc is reading voltage between +2.048V and -2.048V,
-    // at 16 bits of resolution (65535 possible values). That's a full peak to peak range of (2.048 * 2 = 4.096).
-    // 4.096 / 65535 = .0625. So 16 bits can tell us a value between +-2.048v within .0625v of accuracy.
-    // To calculate the actual voltage value, you can think of it like divisions on an oscilliscope.
-    // Whatever it spits out, you have to multiply it by whatever each division represents.
-    // In our case, .0625. If you change the gain in the future, you gotta see what that full pk2pk range is,
-    // divide it by the resolution of the adc (16 bits [65535] for the ADS 1115), and use that as your 'multiplier'.
-    mv = a0_a1 * multiplier;
-    delta = mv - prev_mv;
-    vector = delta > 0 ? 1 : -1;
-
-    if (vector == -1 && prev_vector == 1) {
-      // Voltage is dropping from its positive peak.
-      // This means the last mv value is the peak.
-      // Calculate rms of the peak voltage. Keep it simple.
-      // prev_mv is in millivolts, so divide by 1000 to turn it back into whole Volts.
-      // Then x100 because the SCT-013-000V puts out 1V per 100A.
-      // Then x.707 to get rough rms.
-      current_rms = prev_mv / 1000 * 100 * 0.707f;
-      if (current_rms > 0 && WiFi.status() == WL_CONNECTED) {
-        if (client.connect(host, port)) {
-          memset(tempFloat, 0, FLOAT_SIZE_MAX);
-          memset(msg, 0, MSG_SIZE_MAX);
-          dtostrf(current_rms, 3, 2, tempFloat);
-          snprintf(msg, MSG_SIZE_MAX, "sp:%s", tempFloat);
-          if (client.connected()) { client.println(msg); }
-          //Serial.println(msg);
-          client.stop();
-        } else {
-          //Serial.println("connection failed");
-          delay(500);
-        }
-      }
-      led_timer = 20;
+  if (amps_rms > 0.05f) {
+    if (client.connect(host, port)) {
+      memset(tempFloat, 0, FLOAT_SIZE_MAX);
+      memset(msg, 0, MSG_SIZE_MAX);
+      dtostrf(amps_rms, 3, 2, tempFloat);
+      snprintf(msg, MSG_SIZE_MAX, "dev=1 amps=%s\n", tempFloat);
+      if (client.connected()) { client.println(msg); }
+      //Serial.println(msg);
+      client.stop();
     }
-    prev_vector = vector;
-    prev_mv = mv;
+    led_timer = 20;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    // wifi died. try to reconnect
+    connectToWifi();
+  } else {
+    httpServer.handleClient();
+    MDNS.update();
   }
 }
