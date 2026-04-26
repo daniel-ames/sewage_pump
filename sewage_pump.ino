@@ -1,73 +1,106 @@
-//
-// This monitors the operation of the sewage pump
-//
-#include <Adafruit_ADS1X15.h> // from package "Adafruit ADS1X15" by Adafruit
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <ESP8266mDNS.h>
-#include <ESP8266HTTPUpdateServer.h>
-#include <time.h>
-#include <TZ.h>
-#include "street_cred.h"
+// void setup() {
+//   // initialize serial communication at 115200 bits per second:
+//   Serial.begin(115200);
 
-#define MSG_SIZE_MAX    32
+//   //set the resolution to 12 bits (0-4095)
+//   analogReadResolution(12);
+// }
+
+// void loop() {
+//   // read the analog / millivolts value for pin 2:
+//   // int analogValue = analogRead(34);
+//   int analogVolts = analogReadMilliVolts(34);
+
+//   // print out the values you read:
+//   // Serial.printf("ADC analog value = %d\n", analogValue);
+//   Serial.printf("ADC millivolts value = %d\n", analogVolts);
+
+//   delay(500);  // delay in between reads for clear read from serial
+// }
+
+
+
+//
+// This monitors the operation of the well house
+//
+#include <WiFi.h>
+#include <Wire.h>
+#include <WebServer.h>
+#include <Update.h>
+#include <time.h>
+#include <esp_system.h>
+// #include "html.h"
+// #include "street_cred.h"
+
+#define MSG_SIZE_MAX    64
 #define FLOAT_SIZE_MAX  8
 #define MAX_WIFI_WAIT   10
 #define RMS_WINDOW      250
 
-// the builtin led is active low for some dipshit reason
-#define ON  LOW
-#define OFF HIGH
+#define ON  HIGH
+#define OFF LOW
+
+#define ADS_SDA  21
+#define ADS_SCL  22
+#define PUMP_CT_ADC_PIN  34
+
 
 const char* host = "optiplex";
 const uint16_t port = 27910;
-
-Adafruit_ADS1115 ads;
-ESP8266WebServer httpServer(80);
-ESP8266HTTPUpdateServer httpUpdater;
-
-#define SYS_STATUS_PAGE_STR_LEN 2560
-char systemStatusPageStr[SYS_STATUS_PAGE_STR_LEN];
-char httpStr[256] = {0};
-char uptime[41] = {0};
-char current_time[41] = {0};
-char last_flush_time[41] = {0};
+bool remote_control_inited = false;
 
 // The CTs are supposedly 100a/v, but that's a big fat
 // load of cheap chinese hooey. These values are derived
 // from measuring against a real clamp meter.
-// TODO: calibrate this for sewage pump
-float ct_amps_per_volt = 151.7f;
+float ct_amps_per_volt = 104.0f;   // dadbg: actually that's not too bad!
 
-float adc_lsb = 0.0;  // least significant bit - in adc-speak, this is volts per tick. IOW, how much does the voltage change whenever just the LSB of the reading changes. (Thanks, Sprocket)
 
-float amps_rms = 0.0f;
+float arms = 0.0;
+char temp_x[FLOAT_SIZE_MAX];
 
 WiFiClient client;
 char msg[MSG_SIZE_MAX];
-char tempFloat[FLOAT_SIZE_MAX];
 
 int led_timer = 0;
 bool led_on = false;
 
-void connectToWifi()
+WebServer web_server(80);
+
+#define SYS_STATUS_PAGE_STR_LEN 2560
+char httpStr[256] = {0};
+char systemStatusPageStr[SYS_STATUS_PAGE_STR_LEN];
+uint8_t wifi_disconnect_reason = 0;
+char uptime[41] = {0};
+char current_time[41] = {0};
+char boot_time[41] = {0};
+char last_sample_time[41] = {0};
+uint32_t heap_max_alloc_boot = 0;
+
+float adc_lsb = 0.0;  // least significant bit - in adc-speak, this is volts per tick. IOW, how much does the voltage change whenever just the LSB of the reading changes. (Thanks, Sprocket)
+
+static const char *ntp1 = "pool.ntp.org";
+static const char *ntp2 = "time.nist.gov";
+static const char *ntp3 = "time.google.com";
+
+void get_time(char *time_buf, int size)
 {
-  int wifiRetries = 0;
-  WiFi.mode(WIFI_STA);
-  Serial.print("WiFi is down. Connecting");
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED && wifiRetries < MAX_WIFI_WAIT) {
-    delay(1000);
-    wifiRetries++;
-    Serial.print(".");
+  int time_retries = 40;  // try for about 10 seconds
+
+  memset(time_buf, 0, size);
+
+  time_t now = time(nullptr);
+  while (now < 8 * 3600 * 2 && time_retries) {   // basically "still 1970?"
+    delay(250);
+    now = time(nullptr);
+    time_retries--;
   }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("WiFi connected");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
+
+  if (time_retries) {
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    strftime(time_buf, size, "%m-%d-%Y %I:%M:%S %p", &tm_now);
   } else {
-     Serial.println("WiFi failed to connect");
+    snprintf(time_buf, size, "unknown");
   }
 }
 
@@ -114,137 +147,212 @@ void millisToDaysHoursMinutes(unsigned long milliseconds, char* str, int length)
     snprintf(str, 35, "%d day%s, %d hour%s and %d minute%s", days, days == 1 ? "" : "s", hours, hours == 1 ? "" : "s", minutes, minutes == 1 ? "" : "s");
 }
 
-void get_time(char *time_buf, int size)
-{
-  int time_retries = 40;  // try for about 10 seconds
-
-  memset(time_buf, 0, size);
-  configTime(TZ_America_Chicago, "pool.ntp.org");
-
-  time_t now = time(nullptr);
-  while (now < 8 * 3600 * 2 && time_retries) {   // basically "still 1970?"
-    delay(250);
-    now = time(nullptr);
-    time_retries--;
-  }
-
-  if (time_retries) {
-    struct tm tm_now;
-    localtime_r(&now, &tm_now);
-    strftime(time_buf, size, "%m-%d-%Y %I:%M:%S %p", &tm_now);
-  } else {
-    snprintf(time_buf, size, "unknown");
+static const char* wifi_reason_str(uint8_t r) {
+  switch (r) {
+    case 0:                                   return "It hasn't. yet.";
+    case WIFI_REASON_AUTH_EXPIRE:             return "AUTH_EXPIRE";
+    case WIFI_REASON_AUTH_LEAVE:              return "AUTH_LEAVE";
+    case WIFI_REASON_ASSOC_EXPIRE:            return "ASSOC_EXPIRE";
+    case WIFI_REASON_ASSOC_TOOMANY:           return "ASSOC_TOOMANY";
+    case WIFI_REASON_NOT_AUTHED:              return "NOT_AUTHED";
+    case WIFI_REASON_NOT_ASSOCED:             return "NOT_ASSOCED";
+    case WIFI_REASON_ASSOC_LEAVE:             return "ASSOC_LEAVE";
+    case WIFI_REASON_ASSOC_NOT_AUTHED:        return "ASSOC_NOT_AUTHED";
+    case WIFI_REASON_DISASSOC_PWRCAP_BAD:     return "DISASSOC_PWRCAP_BAD";
+    case WIFI_REASON_DISASSOC_SUPCHAN_BAD:    return "DISASSOC_SUPCHAN_BAD";
+    case WIFI_REASON_BSS_TRANSITION_DISASSOC: return "BSS_TRANSITION_DISASSOC";
+    case WIFI_REASON_IE_INVALID:              return "IE_INVALID";
+    case WIFI_REASON_MIC_FAILURE:             return "MIC_FAILURE";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:  return "4WAY_HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_GROUP_KEY_UPDATE_TIMEOUT:return "GROUP_KEY_UPDATE_TIMEOUT";
+    case WIFI_REASON_IE_IN_4WAY_DIFFERS:      return "IE_IN_4WAY_DIFFERS";
+    case WIFI_REASON_GROUP_CIPHER_INVALID:    return "GROUP_CIPHER_INVALID";
+    case WIFI_REASON_PAIRWISE_CIPHER_INVALID: return "PAIRWISE_CIPHER_INVALID";
+    case WIFI_REASON_AKMP_INVALID:            return "AKMP_INVALID";
+    case WIFI_REASON_UNSUPP_RSN_IE_VERSION:   return "UNSUPP_RSN_IE_VERSION";
+    case WIFI_REASON_INVALID_RSN_IE_CAP:      return "INVALID_RSN_IE_CAP";
+    case WIFI_REASON_802_1X_AUTH_FAILED:      return "802_1X_AUTH_FAILED";
+    case WIFI_REASON_CIPHER_SUITE_REJECTED:   return "CIPHER_SUITE_REJECTED";
+    case WIFI_REASON_BEACON_TIMEOUT:          return "BEACON_TIMEOUT";
+    case WIFI_REASON_NO_AP_FOUND:             return "NO_AP_FOUND";
+    case WIFI_REASON_AUTH_FAIL:               return "AUTH_FAIL";
+    case WIFI_REASON_ASSOC_FAIL:              return "ASSOC_FAIL";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:       return "HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_CONNECTION_FAIL:         return "CONNECTION_FAIL";
+    case WIFI_REASON_AP_TSF_RESET:            return "AP_TSF_RESET";
+    case WIFI_REASON_ROAMING:                 return "ROAMING";
+    default: return "UNKNOWN";
   }
 }
 
-char* getSystemStatus()
-{
-  String html;
+
+
+// char* getSystemStatus()
+// {
+//   String html;
+//   // Pardon the html mess. Gotta tell the browser to not make the text super tiny.
+//   html = "<!DOCTYPE html><html><head><title>Well House</title></head><body><p style=\"font-size:36px\">";
+//   html += "<span style=\"font-size:80px\">";
+
+//   get_time(current_time, sizeof(current_time));
+
+//   // Longest string example, 82 chars: Notifications are <span id='lights_span' style="color:Green;">ON</span>
+//   snprintf(httpStr, 100, "RSSI: %d, last disconnect reason: <span style=\"color:Green;\">%s</span>", WiFi.RSSI(), wifi_reason_str(wifi_disconnect_reason));
+//   html += httpStr; html += "</br>";
+
+//   snprintf(httpStr, 60, "Boot Time: %s", boot_time);
+//   html += httpStr; html += "</br>";
+
+//   snprintf(httpStr, 60, "Current Time: %s", current_time);
+//   html += httpStr; html += "</br>";
+
+//   millisToDaysHoursMinutes(millis(), uptime, 40);
+//   snprintf(httpStr, 60, "Uptime: %s", uptime);
+//   html += httpStr; html += "</br>";
+
+//   snprintf(httpStr, 60, "Last sample: %s", last_sample_time);
+//   html += httpStr; html += "</br>";
+
+//   snprintf(httpStr, 60, "x: %f, y: %f", arms, arms_y);
+//   html += httpStr; html += "</br>";
   
-  get_time(current_time, sizeof(current_time));
-
-  // Pardon the html mess. Gotta tell the browser to not make the text super tiny.
-  html = "<!DOCTYPE html><html><head><title>Sewage Pump</title></head><body><p style=\"font-size:36px\">";
-  html += "<span style=\"font-size:90px\">";
-
-  // Longest string example, 82 chars: Notifications are <span id='lights_span' style="color:Green;">ON</span>
-  snprintf(httpStr, 100, "RSSI: %d", WiFi.RSSI());
-  html += httpStr;
-  html += "</br>";
-  snprintf(httpStr, 60, "System time: %s", current_time);
-  html += httpStr;
-  html += "</br>";
-  millisToDaysHoursMinutes(millis(), uptime, 40);
-  snprintf(httpStr, 60, "Uptime: %s", uptime);
-  html += httpStr;
-  html += "</br>";
-  snprintf(httpStr, 60, "Last flush: %s", last_flush_time);
-  html += httpStr;
-  html += "</br>";
-  html += "</span></br>";
+//   html += "</br>";
   
-  // Close it off
-  html += "</p></body></html>";
+//   uint32_t heap_total     = ESP.getHeapSize();
+//   uint32_t heap_free      = ESP.getFreeHeap();
+//   uint32_t heap_min_free  = ESP.getMinFreeHeap();
+//   uint32_t heap_max_alloc = ESP.getMaxAllocHeap();
 
-  memset(systemStatusPageStr, 0, SYS_STATUS_PAGE_STR_LEN);
-  html.toCharArray(systemStatusPageStr, html.length() + 1);
-  return systemStatusPageStr;
-}
+//   uint32_t heap_used = heap_total - heap_free;
+//   float heap_used_pct = 0.0f;
+//   if (heap_total != 0)
+//     heap_used_pct = (100.0f * (float)heap_used) / (float)heap_total;
 
-
-// Because you're going to come back in here years later and not know wth this is doing, here's a bone.
-// Remember that a0_a1 is a reading of the differential voltage between A0 and A1 of the ADC.
-// We set the gain at "GAIN_TWO", which means the adc is reading voltage between +2.048V and -2.048V,
-// at 16 bits of resolution (65535 possible values). That's a full peak to peak range of (2.048 * 2 = 4.096).
-// 4.096 / 65535 = 62.5uV. So 16 bits can tell us a value between +-2.048v within 62.5uv of accuracy.
-// To calculate the actual voltage value, you can think of it like divisions on an oscilliscope.
-// Whatever it spits out, you have to multiply it by whatever each division represents.
-// In our case, 62.5uv. If you change the gain in the future, this handy helper (Sprocket wrote it) will
-// map the gain to the LSB - Least Significant Bit. LSB is adc-speak for what I would call volts per division.
-float adcLsbVoltsForCurrentGain() {
-  adsGain_t g = ads.getGain();
-  float fs = 4.096f; // default for GAIN_ONE
-  switch (g) {
-    case GAIN_TWOTHIRDS: fs = 6.144f; break;
-    case GAIN_ONE:       fs = 4.096f; break;
-    case GAIN_TWO:       fs = 2.048f; break;
-    case GAIN_FOUR:      fs = 1.024f; break;
-    case GAIN_EIGHT:     fs = 0.512f; break;
-    case GAIN_SIXTEEN:   fs = 0.256f; break;
-    default:             fs = 4.096f; break;
-  }
-  return fs / 32768.0f;
-}
+//   // Keep an eye on memory gremlins
+//   snprintf(httpStr, 60, "=== Heap ===");
+//   html += httpStr; html += "</br>";
+//   snprintf(httpStr, 60, "Total: %lu", heap_total);
+//   html += httpStr; html += "</br>";
+//   snprintf(httpStr, 60, "Used : %lu (%.1f%%)", heap_used, heap_used_pct);
+//   html += httpStr; html += "</br>";
+//   snprintf(httpStr, 60, "Free : %lu", heap_free);
+//   html += httpStr; html += "</br>";
+//   snprintf(httpStr, 60, "Low water  : %lu", heap_min_free);
+//   html += httpStr; html += "</br>";
+//   snprintf(httpStr, 60, "Max alloc  : %lu", heap_max_alloc);
+//   html += httpStr; html += "</br>";
+//   snprintf(httpStr, 60, "Max alloc @ boot : %lu", heap_max_alloc_boot);
+//   html += httpStr; html += "</br>";
 
 
-void setup()
+//   html += "</span></br>";
+  
+//   // Close it off
+//   html += "</p></body></html>";
+
+//   memset(systemStatusPageStr, 0, SYS_STATUS_PAGE_STR_LEN);
+//   html.toCharArray(systemStatusPageStr, html.length() + 1);
+//   return systemStatusPageStr;
+// }
+
+
+// void init_remote_control()
+// {
+//   if (remote_control_inited) return;
+
+//   web_server.on("/", HTTP_GET, []() {
+//     web_server.sendHeader("Connection", "close");
+//     web_server.send(200, "text/html", getSystemStatus());
+//   });
+//   // web_server.on("/toggle_mute", HTTP_POST, []() {
+//   //   char notificationsMuted = EEPROM.read(EEPROM_MUTE_NOTIFICATIONS_BYTE);
+//   //   notificationsMuted = notificationsMuted == 1 ? 0 : 1;
+//   //   EEPROM.write(EEPROM_MUTE_NOTIFICATIONS_BYTE, (byte)notificationsMuted);
+//   //   EEPROM.commit();
+//   //   web_server.send(200, "text/plain", notificationsMuted == 1 ? "Turn On" : "Turn Off");
+//   // });
+//   web_server.on("/update", HTTP_GET, []() {
+//     web_server.sendHeader("Connection", "close");
+//     web_server.send(200, "text/html", update_html);
+//   });
+//   /*handling uploading firmware file */
+//   web_server.on("/update_backend", HTTP_POST, []() {
+//     web_server.sendHeader("Connection", "close");
+//     web_server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
+//     ESP.restart();
+//   }, []() {
+//     HTTPUpload& upload = web_server.upload();
+//     if (upload.status == UPLOAD_FILE_START) {
+//       Serial.printf("Update: %s\n", upload.filename.c_str());
+//       if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { //start with max available size
+//         Update.printError(Serial);
+//       }
+//     } else if (upload.status == UPLOAD_FILE_WRITE) {
+//       /* flashing firmware to ESP*/
+//       if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+//         Update.printError(Serial);
+//       }
+//     } else if (upload.status == UPLOAD_FILE_END) {
+//       if (Update.end(true)) { //true to set the size to the current progress
+//         Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+//       } else {
+//         Update.printError(Serial);
+//       }
+//     }
+//   });
+//   web_server.begin();
+//   Serial.println("Web server initialized");
+//   remote_control_inited = true;
+// }
+
+
+
+// bool connectToWifi()
+// {
+//   int wifiRetries = 0;
+//   WiFi.mode(WIFI_STA);
+//   Serial.print("WiFi is down. Connecting");
+//   WiFi.begin(ssid, password);
+//   while (WiFi.status() != WL_CONNECTED && wifiRetries < MAX_WIFI_WAIT) {
+//     delay(1000);
+//     wifiRetries++;
+//     Serial.print(".");
+//   }
+//   Serial.println();
+//   if (WiFi.status() == WL_CONNECTED) {
+//     Serial.println("WiFi connected");
+//     Serial.print("IP address: ");
+//     Serial.println(WiFi.localIP());
+//     return true;
+//   } else {
+//      Serial.println("WiFi failed to connect");
+//   }
+//   return false;
+// }
+
+unsigned long reconnect_interval = 10000;
+// void reconnect_wifi()
+// {
+//   static unsigned long prev_millis = 0;
+//   static bool led_state = false;
+//   unsigned long current_millis = millis();
+//   if(current_millis - prev_millis >= reconnect_interval) {
+//     prev_millis = current_millis;
+//     Serial.print("WiFi is down. Connecting to ");
+//     Serial.println(ssid);
+//     WiFi.mode(WIFI_STA);
+//     WiFi.begin(ssid, password);
+//     led_state = !led_state;
+//     digitalWrite(LED_BUILTIN, led_state);
+//   }
+// }
+
+void wifi_event(WiFiEvent_t event, WiFiEventInfo_t info)
 {
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, OFF);
-
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println("Hello");
-
-  Serial.println(); Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
-
-  connectToWifi();
-
-  Wire.begin();
-  ads.begin();
-
-  MDNS.begin(ota_hostname);
-
-  httpServer.on("/", HTTP_GET, []() {
-    httpServer.sendHeader("Connection", "close");
-    httpServer.send(200, "text/html", getSystemStatus());
-  });
-
-  httpUpdater.setup(&httpServer);
-  httpServer.begin();
-
-  MDNS.addService("http", "tcp", 80);
-
-  snprintf(last_flush_time, sizeof(last_flush_time), "No flushes yet");
-
-  //                                                                ADS1015  ADS1115
-  //                                                                -------  -------
-  // ads.setGain(GAIN_TWOTHIRDS);  // 2/3x gain +/- 6.144V  1 bit = 3mV      0.1875mV (default)
-  // ads.setGain(GAIN_ONE);        // 1x gain   +/- 4.096V  1 bit = 2mV      0.125mV
-  // ads.setGain(GAIN_TWO);        // 2x gain   +/- 2.048V  1 bit = 1mV      0.0625mV
-  // ads.setGain(GAIN_FOUR);       // 4x gain   +/- 1.024V  1 bit = 0.5mV    0.03125mV
-  // ads.setGain(GAIN_EIGHT);      // 8x gain   +/- 0.512V  1 bit = 0.25mV   0.015625mV
-  // ads.setGain(GAIN_SIXTEEN);    // 16x gain  +/- 0.256V  1 bit = 0.125mV  0.0078125mV
-
-  // The above is taken from https://github.com/GreenPonik/Adafruit_ADS1X15/blob/7fce1e43c48ae32c40f806362060d91b34de3318/examples/differential/differential.pde
-  // The output of the SCT-013-000V (which I'm pretty sure is what i have) will be between 0V-1V.
-  // 1V means 100A which we should never see, BUT, anything can happen sometimes. i don't wanna damage my ADC.
-  // So go with GAIN_TWO. That should keep us safe.
-  ads.setGain((adsGain_t)GAIN_TWO);
-  adc_lsb = adcLsbVoltsForCurrentGain();
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED)
+    wifi_disconnect_reason = info.wifi_sta_disconnected.reason;
 }
+
 
 // Read RMS amps of the pump
 void pump_current()
@@ -253,14 +361,14 @@ void pump_current()
 
   double sum = 0.0;
   double sumsq = 0.0;
-  int16_t reading;
+  int16_t x;
   uint32_t samples = 0;
 
   while (millis() - start_time < RMS_WINDOW) {
-    reading = ads.readADC_Differential_0_1();
+    x = analogReadMilliVolts(PUMP_CT_ADC_PIN);
 
-    sum += reading;
-    sumsq += (double)reading * (double)reading;
+    sum += x;
+    sumsq += (double)x * (double)x;
     samples++;
   }
 
@@ -272,29 +380,70 @@ void pump_current()
   // The mean is the DC component
   double mean = sum / (double)samples;
   double ex2  = sumsq / (double)samples;
-
   // Remove the DC component
-  double var  = ex2 - mean * mean;
+  double variance  = ex2 - mean * mean;
   
-  if (var < 0) var = 0;
+  if (variance < 0) variance = 0;
 
   // Variance is a squared value. Remove the square
   // to get back to real ticks.
-  double adc_ticks = sqrt(var);
-
-  // Convert ADC ticks to actual voltage at ADS input
-  float vrms = (float)adc_ticks * adc_lsb;
+  double vrms_mv = sqrt(variance);
+  float  vrms = (float)(vrms_mv / 1000.0);
 
   // The SCT-013-000 has "100A/1V" tattooed on it in a chinese accent.
-  // ct_amps_per_volt is an adjusted value derived from real testing and compared
+  // ct_amps_per_volt_* are adjusted values derived from real testing and compared
   // to a real clamp meter.
-  amps_rms = vrms * ct_amps_per_volt;
+  arms = vrms * ct_amps_per_volt;
+}
+
+
+/////////////////////////////////////
+
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, OFF);
+
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("Hello");
+  Serial.print("My mac address is: ");
+  Serial.println(WiFi.macAddress());
+
+  // 12-bit ADC width on classic ESP32
+  analogReadResolution(12);
+
+  // Use the widest input range.
+  // Most Arduino-ESP32 cores call this ADC_11db.
+  // Some newer environments may expose ADC_12db instead.
+#if defined(ADC_12db)
+  analogSetPinAttenuation(PUMP_CT_ADC_PIN, ADC_12db);
+#else
+  analogSetPinAttenuation(PUMP_CT_ADC_PIN, ADC_11db);
+#endif
+
+  // Serial.println(); Serial.println();
+  // Serial.print("Connecting to ");
+  // Serial.println(ssid);
+
+  // if(connectToWifi()) init_remote_control();
+
+  // WiFi.onEvent(wifi_event);
+
+  // setup the time parameters. Should only have to do this once
+  // configTzTime("CST6CDT,M3.2.0,M11.1.0", ntp1, ntp2, ntp3);
+
+  // Save off the boot time
+  // get_time(boot_time, sizeof(boot_time));
+
+  // snprintf(last_sample_time, sizeof(last_sample_time), "None yet");
+
+  heap_max_alloc_boot = ESP.getMaxAllocHeap();
 }
 
 
 void loop()
 {
-  amps_rms = 0.0;
+  arms = 0.0;
 
   // Read current
   pump_current();
@@ -304,33 +453,19 @@ void loop()
       digitalWrite(LED_BUILTIN, ON);
       led_on = true;
     }
+    // The timer will drain when the readings stop coming in
     led_timer--;
   } else {
     if (led_on) {
       digitalWrite(LED_BUILTIN, OFF);
       led_on = false;
-      get_time(last_flush_time, sizeof(last_flush_time));
+      get_time(last_sample_time, sizeof(last_sample_time));
     }
   }
 
-  if (amps_rms > 0.05f) {
-    if (client.connect(host, port)) {
-      memset(tempFloat, 0, FLOAT_SIZE_MAX);
-      memset(msg, 0, MSG_SIZE_MAX);
-      dtostrf(amps_rms, 3, 2, tempFloat);
-      snprintf(msg, MSG_SIZE_MAX, "dev=1 amps=%s\n", tempFloat);
-      if (client.connected()) { client.println(msg); }
-      //Serial.println(msg);
-      client.stop();
-    }
+  if(arms > 0.05f) {
+    Serial.println(arms);
     led_timer = 20;
   }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    // wifi died. try to reconnect
-    connectToWifi();
-  } else {
-    httpServer.handleClient();
-    MDNS.update();
-  }
 }
